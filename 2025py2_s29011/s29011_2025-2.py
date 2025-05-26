@@ -1,117 +1,141 @@
 #!/usr/bin/env python3
-"""
-NCBI GenBank Data Retriever
-Podstawowy skrypt do łączenia się z NCBI i pobierania rekordów sekwencji genetycznych dla danego identyfikatora taksonomicznego.
-"""
-from Bio import Entrez
+
+import csv
+import sys
 import time
-import os
+from datetime import datetime
+from typing import List, Optional
+
+from Bio import Entrez, SeqIO
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 class NCBIRetriever:
-    def __init__(self, email, api_key):
-        """Initialize with NCBI credentials."""
-        self.email = email
-        self.api_key = api_key
 
-        # Ustawienia Entrez
+    def __init__(self, email: str, api_key: str):
         Entrez.email = email
         Entrez.api_key = api_key
-        Entrez.tool = 'BioScriptEx10'
 
-    def search_taxid(self, taxid):
-        """Search for all records associated with a taxonomic ID."""
-        print(f"Searching for records with taxID: {taxid}")
-        try:
-            # Najpierw pobierz informacje taksonomiczne
-            handle = Entrez.efetch(db="taxonomy", id=taxid, retmode="xml")
-            records = Entrez.read(handle)
-            organism_name = records[0]["ScientificName"]
-            print(f"Organism: {organism_name} (TaxID: {taxid})")
+        self.webenv: Optional[str] = None
+        self.query_key: Optional[str] = None
+        self.count: int = 0
 
-            # Szukaj rekordów
-            search_term = f"txid{taxid}[Organism]"
-            handle = Entrez.esearch(db="nucleotide", term=search_term, usehistory="y")
-            search_results = Entrez.read(handle)
-            count = int(search_results["Count"])
+    def search(self, taxid: str, min_len: Optional[int], max_len: Optional[int]) -> int:
+        query = f"txid{taxid}[Organism]"
+        if min_len is not None or max_len is not None:
+            _min = min_len if min_len is not None else 1
+            _max = max_len if max_len is not None else 1_000_000_000
+            query += f" AND {_min}:{_max}[SLEN]"
 
-            if count == 0:
-                print(f"No records found for {organism_name}")
-                return None
+        with Entrez.esearch(db="nucleotide", term=query, usehistory="y", retmax=0) as h:
+            res = Entrez.read(h)
 
-            print(f"Found {count} records")
+        self.webenv = res["WebEnv"]
+        self.query_key = res["QueryKey"]
+        self.count = int(res["Count"])
+        return self.count
+
+    def _fetch_batch(self, start: int, size: int = 500):
+        if self.webenv is None or self.query_key is None:
+            raise RuntimeError("error")
+
+        with Entrez.efetch(
+            db="nucleotide",
+            rettype="gb",
+            retmode="text",
+            retstart=start,
+            retmax=size,
+            webenv=self.webenv,
+            query_key=self.query_key,
+        ) as h:
+            yield from SeqIO.parse(h, "gb")
+
+    def fetch_all(self, limit: Optional[int] = None, delay: float = 0.34):
+        remaining = self.count if limit is None else min(limit, self.count)
+        start = 0
+        while remaining > 0:
+            batch = min(remaining, 500)
+            for rec in self._fetch_batch(start, batch):
+                yield rec
+            remaining -= batch
+            start += batch
+            time.sleep(delay)
+
+def write_csv(records: List[SeqIO.SeqRecord], path: str):
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["Accession", "Length", "Description"])
+        for r in records:
+            w.writerow([r.id, len(r.seq), r.description])
 
 
-            self.webenv = search_results["WebEnv"]
-            self.query_key = search_results["QueryKey"]
-            self.count = count
+def plot_lengths(records: List[SeqIO.SeqRecord], path: str):
+    sorted_recs = sorted(records, key=lambda r: len(r.seq), reverse=True)
+    accs = [r.id for r in sorted_recs]
+    lengths = [len(r.seq) for r in sorted_recs]
 
-            return count
+    plt.figure(figsize=(max(8, len(accs) * 0.3), 6))
+    plt.plot(accs, lengths, marker="o")
+    plt.xticks(rotation=90, fontsize=7)
+    plt.xlabel("GenBank accession")
+    plt.ylabel("Sequence length (bp)")
+    plt.title("Sequence lengths sorted descending")
+    plt.tight_layout()
+    plt.savefig(path, dpi=300)
+    plt.close()
 
-        except Exception as e:
-            print(f"Error searching TaxID {taxid}: {e}")
-            return None
 
-    def fetch_records(self, start=0, max_records=10):
-            """Fetch a batch of records using the stored search results."""
-            if not hasattr(self, 'webenv') or not hasattr(self, 'query_key'):
-                print("No search results to fetch. Run search_taxid() first.")
-                return []
-
-            try:
-                # Limit, aby zapobiec przeciążeniu serwera
-                batch_size = min(max_records, 500)
-
-                handle = Entrez.efetch(
-                    db="nucleotide",
-                    rettype="gb",
-                    retmode="text",
-                    retstart=start,
-                    retmax=batch_size,
-                    webenv=self.webenv,
-                    query_key=self.query_key
-                )
-
-                # Surowy rekord GenBank
-                records_text = handle.read()
-
-                return records_text
-
-            except Exception as e:
-                print(f"Error fetching records: {e}")
-                return ""
+def prompt_int(msg: str) -> Optional[int]:
+    val = input(msg).strip()
+    if val == "":
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        print("Wartość musi być liczbą całkowitą")
+        return None
 
 
 def main():
-    # Uzyskaj dane uwierzytelniające
-    email = input("Enter your email address for NCBI: ")
-    api_key = input("Enter your NCBI API key: ")
 
-    # Utwórz obiekt retriever
+    email = input("Enter your email address for NCBI: ").strip()
+    api_key = input("Enter your NCBI API key: ").strip()
+    taxid = input("Enter taxonomic ID (taxid) of the organism: ").strip()
+
+    min_len = prompt_int("Minimal sequence length ")
+    max_len = prompt_int("Maximal sequence length ")
+    max_records = prompt_int("Maximum records to download ")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prefix = f"taxid_{taxid}_{timestamp}"
+    csv_file = f"{prefix}.csv"
+    png_file = f"{prefix}.png"
+
     retriever = NCBIRetriever(email, api_key)
 
-    taxid = input("Enter taxonomic ID (taxid) of the organism: ")
+    print("\nSearching GenBank…")
+    total = retriever.search(taxid, min_len, max_len)
+    if total == 0:
+        print("Not found")
+        sys.exit(0)
 
-    # Szukaj rekordów
-    count = retriever.search_taxid(taxid)
+    print(f"Found {total} records. Downloading…")
+    records = list(retriever.fetch_all(limit=max_records))
+    print(f"Downloaded {len(records)} records.")
 
-    if not count:
-        print("No records found. Exiting.")
-        return
+    if not records:
+        print("Download failed – exiting.")
+        sys.exit(1)
 
-    # Pobierz kilka pierwszych rekordów jako próbkę
-    print("\nFetching sample records...")
-    sample_records = retriever.fetch_records(start=0, max_records=5)
+    write_csv(records, csv_file)
+    print(f"CSV report saved -> {csv_file}")
 
-    # Zapisz do pliku
-    output_file = f"taxid_{taxid}_sample.gb"
-    with open(output_file, "w") as f:
-        f.write(sample_records)
-
-    print(f"Saved sample records to {output_file}")
-    print("\nNote: This is just a basic retriever. You need to extend its functionality!")
+    plot_lengths(records, png_file)
+    print(f"Length plot saved -> {png_file}\n")
 
 
 if __name__ == "__main__":
     main()
-
