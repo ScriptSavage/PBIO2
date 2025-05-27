@@ -116,18 +116,15 @@ def main():
 
     retriever = NCBIRetriever(email, api_key)
 
-    print("\nSearching GenBank…")
     total = retriever.search(taxid, min_len, max_len)
     if total == 0:
         print("Not found")
         sys.exit(0)
 
-    print(f"Found {total} records. Downloading…")
     records = list(retriever.fetch_all(limit=max_records))
-    print(f"Downloaded {len(records)} records.")
 
     if not records:
-        print("Download failed – exiting.")
+        print("Download failed")
         sys.exit(1)
 
     write_csv(records, csv_file)
@@ -135,7 +132,6 @@ def main():
 
     plot_lengths(records, png_file)
     print(f"Length plot saved -> {png_file}\n")
-
 
 if __name__ == "__main__":
     main()
